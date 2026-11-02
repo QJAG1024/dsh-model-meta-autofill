@@ -21,7 +21,7 @@
  * @module dsh-model-meta-autofill/enrich
  */
 
-import { deepEqualJson } from '@deepseek-ai/dsh-settings'
+import { deepEqualJson } from '@deepseek-ai/dsh-util-values'
 import type { LookedUpEntry } from './dataset.ts'
 
 /** The llm-pi-ai model profile fields this plugin may fill. */
@@ -87,18 +87,42 @@ const PRESERVED_FIELDS: readonly (keyof ModelHead)[] = [
   'compat',
 ]
 
+/** Whether a value is a plain object with no own keys. */
+function isEmptyDict(value: unknown): boolean {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    && Object.keys(value as Record<string, unknown>).length === 0
+}
+
+/**
+ * Whether one resolved field is schema-materialized noise rather than a value
+ * the user or the catalog put there. Resolution materializes every declared
+ * default, so an entry that never mentioned `input` reads back as `input: []`
+ * and one that never mentioned `compat` reads back as
+ * `compat: { chatTemplateKwargs: {}, chatTemplateArgs: {} }` (pi-ai's defaults).
+ * Restating those would turn adapter defaults into explicit user configuration,
+ * so they are dropped. A field the user really set survives: `input` is kept
+ * when non-empty, and `compat` is kept as soon as any value carries meaning.
+ */
+export function isMaterializedNoise(field: string, value: unknown): boolean {
+  if (field === 'input') return Array.isArray(value) && value.length === 0
+  if (field === 'compat' && typeof value === 'object' && value !== null && !Array.isArray(value)) {
+    return Object.values(value as Record<string, unknown>)
+      .every((inner) => inner === undefined || isEmptyDict(inner))
+  }
+  return false
+}
+
 /**
  * A clean, JSON-friendly copy of one entry's metadata: only
- * schema-meaningful fields, with `undefined` and schema-materialized
- * `input: []` noise stripped. No `id` — the caller decides whether the
- * target entry carries one.
+ * schema-meaningful fields, with `undefined` and schema-materialized noise
+ * stripped. No `id` — the caller decides whether the target entry carries one.
  */
 export function cleanHead(head: ModelHead): Record<string, unknown> {
   const out: Record<string, unknown> = {}
   for (const field of PRESERVED_FIELDS) {
     const value = head[field]
     if (value === undefined) continue
-    if (field === 'input' && Array.isArray(value) && value.length === 0) continue
+    if (isMaterializedNoise(field, value)) continue
     // Detach nested data (reasoningEfforts/compat dicts may be frozen shares).
     out[field] = Array.isArray(value) ? [...value] : (typeof value === 'object' && value !== null
       ? { ...(value as Record<string, unknown>) }
@@ -173,6 +197,73 @@ export function enrichListEntry(
 /** Whether an entry still misses metadata this pass could fill. */
 export function entryNeedsFill(entry: ModelHead, meta: LookedUpEntry | undefined, options: EnrichOptions): boolean {
   return fillsFor(entry, meta, options) !== undefined
+}
+
+/** One model a provider endpoint advertised about itself. */
+export interface DiscoveredModel {
+  /** Model id the endpoint accepts. */
+  id: string
+  /** Human-readable name when the endpoint supplies one. */
+  name?: string
+  /** Maximum combined request and response context, when disclosed. */
+  contextWindow?: number
+  /** Maximum output tokens, when disclosed. */
+  maxTokens?: number
+  /** Accepted input modalities when disclosed; absent means unknown. */
+  inputModalities?: readonly ('text' | 'image')[]
+}
+
+/**
+ * Fill the catalog values into the models an endpoint advertised.
+ *
+ * This runs on the RESULT of a provider interrogation, so the rows a user
+ * adopts from it arrive carrying their capacities and never need a separate
+ * fill pass. The rule is the same one the rest of this plugin uses: only
+ * ABSENT fields are filled, so a capacity the endpoint disclosed — or one the
+ * user already tuned, since the editor keeps its own row over the candidate —
+ * is never overwritten. A model the catalog does not know is returned
+ * untouched rather than guessed at.
+ *
+ * A model the endpoint did NOT advertise is never added: discovery answers
+ * what the endpoint serves, and this only describes those answers.
+ *
+ * @param candidates - the models the endpoint advertised, in its own order.
+ * @param lookup - catalog lookup by model id.
+ * @param options - fill toggles.
+ * @returns the same models, in the same order, with catalog gaps filled.
+ */
+export function enrichDiscovered(
+  candidates: readonly DiscoveredModel[],
+  lookup: (id: string) => LookedUpEntry | undefined,
+  options: EnrichOptions,
+): DiscoveredModel[] {
+  return candidates.map((candidate) => {
+    const meta = lookup(candidate.id)
+    if (meta === undefined) return candidate
+    // Project onto the shared `ModelHead` vocabulary so the "only fill what is
+    // absent" rule lives in exactly one place; `inputModalities` is this
+    // surface's spelling of the same field.
+    //
+    // A listing that repeats the model id as its display name has disclosed no
+    // name, and many gateways do exactly that. It is treated as absent so the
+    // catalog's readable name wins instead of being preserved as a placeholder.
+    const named = candidate.name !== undefined && candidate.name.trim().toLowerCase() !== candidate.id.trim().toLowerCase()
+    const head: ModelHead = {
+      ...named ? { name: candidate.name } : {},
+      ...candidate.contextWindow === undefined ? {} : { contextWindow: candidate.contextWindow },
+      ...candidate.maxTokens === undefined ? {} : { maxTokens: candidate.maxTokens },
+      ...candidate.inputModalities === undefined ? {} : { input: [...candidate.inputModalities] },
+    }
+    const fills = fillsFor(head, meta, options)
+    if (fills === undefined) return candidate
+    return {
+      ...candidate,
+      ...fills.name === undefined ? {} : { name: fills.name as string },
+      ...fills.contextWindow === undefined ? {} : { contextWindow: fills.contextWindow as number },
+      ...fills.maxTokens === undefined ? {} : { maxTokens: fills.maxTokens as number },
+      ...fills.input === undefined ? {} : { inputModalities: [...fills.input as ('text' | 'image')[]] },
+    }
+  })
 }
 
 /**
